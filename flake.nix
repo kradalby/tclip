@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-unstable";
+    headscale.url = "github:juanfont/headscale/2d220b2eb8be8d31ed603000d0b0be02c2cd94d0";
     utils.url = "github:numtide/flake-utils";
   };
 
@@ -10,6 +11,7 @@
     self,
     nixpkgs,
     utils,
+    headscale,
   }:
     utils.lib.eachSystem [
       "x86_64-linux"
