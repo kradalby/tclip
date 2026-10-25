@@ -22,46 +22,53 @@
       version = builtins.substring 0 8 self.lastModifiedDate;
       pkgs = import nixpkgs {inherit system;};
     in {
-      packages = rec {
-        tclipd = pkgs.buildGo127Module {
-          pname = "tclipd";
-          version = "0.1.0-${version}";
-          inherit (pkgs) go;
-          src = ./.;
-          subPackages = "cmd/tclipd";
-          vendorHash = "sha256-Bsjwn1/vvmRMWQ+/zuMOgc1A8tDNIPoRU/tVFwgfHgA=";
-        };
-
-        tclip = pkgs.buildGo127Module {
-          pname = "tclip";
-          inherit (tclipd) src version vendorHash;
-          subPackages = "cmd/tclip";
-          inherit (pkgs) go;
-          env.CGO_ENABLED = "0";
-        };
-
-        portable-service = let
-          web-service = pkgs.replaceVars ./run/portable-service/tclip.service.in {
-            inherit tclipd;
+      packages =
+        rec {
+          tclipd = pkgs.buildGo127Module {
+            pname = "tclipd";
+            version = "0.1.0-${version}";
+            inherit (pkgs) go;
+            src = ./.;
+            subPackages = "cmd/tclipd";
+            vendorHash = "sha256-Bsjwn1/vvmRMWQ+/zuMOgc1A8tDNIPoRU/tVFwgfHgA=";
           };
-        in
-          pkgs.portableService {
-            inherit (tclipd) version;
+
+          tclip = pkgs.buildGo127Module {
             pname = "tclip";
-            description = "The tclip service";
-            homepage = "https://github.com/tailscale-dev/tclip";
-            units = [web-service];
-            symlinks = [
-              {
-                object = "${pkgs.cacert}/etc/ssl";
-                symlink = "/etc/ssl";
-              }
-            ];
+            inherit (tclipd) src version vendorHash;
+            subPackages = "cmd/tclip";
+            inherit (pkgs) go;
+            env.CGO_ENABLED = "0";
           };
 
-        # default = docker;
-        default = tclipd;
-      };
+          portable-service = let
+            web-service = pkgs.replaceVars ./run/portable-service/tclip.service.in {
+              inherit tclipd;
+            };
+          in
+            pkgs.portableService {
+              inherit (tclipd) version;
+              pname = "tclip";
+              description = "The tclip service";
+              homepage = "https://github.com/tailscale-dev/tclip";
+              units = [web-service];
+              symlinks = [
+                {
+                  object = "${pkgs.cacert}/etc/ssl";
+                  symlink = "/etc/ssl";
+                }
+              ];
+            };
+
+          # default = docker;
+          default = tclipd;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          e2e = import ./nix/e2e.nix {
+            inherit pkgs headscale;
+            inherit (self.packages.${system}) tclip tclipd;
+          };
+        };
 
       apps.default =
         utils.lib.mkApp {drv = self.packages.${system}.default;};

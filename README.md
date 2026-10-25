@@ -214,3 +214,63 @@ one in its place and re-attach and re-enable the service.
 
 Add the path `/var/lib/private/tclip` to your backup program of
 choice.
+
+
+## Headscale integration tests
+
+On Linux with KVM and Nix sandboxing enabled:
+
+```sh
+nix build .#e2e -L
+```
+
+The test is a Linux-only package, rather than a flake check, so ordinary builds
+and Darwin evaluation do not require KVM.
+
+`nix/e2e.nix` imports the pinned upstream Headscale `testkit` and `testkit-peer`
+modules. Headscale keeps its own nixpkgs input. The server runs the existing
+`tclipd` derivation and portable service unit (there is no project NixOS module),
+including `DynamicUser` and private state directories. Clients use the existing
+`tclip` derivation. Test auth keys are minted inside the VMs, never stored in Nix.
+
+The service uses `TSNET_CONTROL_URL=http://headscale`, `DISABLE_HTTPS=1`, and
+`TSNET_DISABLE_NETNS=1`. The last setting lets an unprivileged service reach the
+VM LAN even though its default route uses another interface. It grants no extra
+capabilities and leaves production interface binding enabled by default.
+
+Coverage:
+
+- Real WhoIs user identity over IPv4 and IPv6, persisted author information,
+  shared reads, CLI file
+  and stdin uploads, form uploads, raw downloads and attachment headers.
+- Owner-only deletion, including another device belonging to the same user;
+  cross-user and spoofed-header denial with successful read/delete controls.
+- Tagged-node authorship and separate ownership for two nodes carrying one tag.
+- Direct-path proof and forced `DERP(headscale)` proof alongside application
+  uploads/downloads; local-user ACLs (`USER@`), tag ACLs, live deny/reallow, and
+  an allowed upload/read while another user is blocked.
+- Unprivileged service execution and private state, SQLite and tsnet identity
+  across restarts without an auth key, durable deletion, invalid authentication
+  and recovery, malformed requests, and direct application traffic during a
+  control-server outage followed by relay recovery.
+- The optional public HTTP listener: individual paste reads work, private routes
+  cannot mutate data, fabricated identity headers cannot grant access, and
+  `HIDE_FUNNEL_USERS` hides authors from public HTML.
+- Real application HTTPS via `ListenTLS`: a locally trusted certificate in the
+  existing tsnet cache, rejection without that trust, direct and DERP uploads,
+  ownership and network denials with allowed controls, and TLS after restart.
+- Funnel startup fails closed without its node capability, with working HTTPS
+  controls before and after the rejected configuration.
+
+The application consumes no custom grants/capabilities. Network authorization
+is exercised through Headscale ACLs; application deletion authorization comes
+from WhoIs, not capability claims. The only capability-dependent application
+feature is Tailscale Funnel, delegated to `tsnet.ListenFunnel`.
+
+These tests do **not** cover cloud Funnel ingress, successful Funnel capability admission,
+`ipn.FunnelConn` classification, or public ACME certificate issuance/renewal.
+Headscale advertises the application certificate domain; the test seeds tsnet's
+existing certificate cache and verifies TLS with an explicit local trust anchor.
+The kit's separate self-signed control/DERP certificate is not reused for the app. The public HTTP test covers its shared
+read-only mux, not the cloud Funnel transport or its TLS connection context.
+HTTP application traffic inside the tailnet still travels over WireGuard.
