@@ -4,6 +4,7 @@
   headscale,
   tclip,
   tclipd,
+  service,
 }: let
   policy = sources:
     pkgs.writeText "tclip-policy.json" (
@@ -36,7 +37,6 @@
     ];
     virtualisation.memorySize = 512;
   };
-  service = pkgs.replaceVars ../run/portable-service/tclip.service.in {inherit tclipd;};
 in
   pkgs.testers.runNixOSTest {
     name = "tclip-headscale";
@@ -62,7 +62,7 @@ in
         systemd.packages = [
           (pkgs.runCommand "tclip-unit" {} ''
             mkdir -p $out/lib/systemd/system
-            cp ${service} $out/lib/systemd/system/tclip.service
+            cp ${service} $out/lib/systemd/system/${service.name}
           '')
         ];
         systemd.services.tclip = {

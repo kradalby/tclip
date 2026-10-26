@@ -21,6 +21,11 @@
     ] (system: let
       version = builtins.substring 0 8 self.lastModifiedDate;
       pkgs = import nixpkgs {inherit system;};
+      service = pkgs.replaceVarsWith {
+        name = "tclip.service";
+        src = ./run/portable-service/tclip.service.in;
+        replacements.tclipd = self.packages.${system}.tclipd;
+      };
     in {
       packages =
         rec {
@@ -41,31 +46,26 @@
             env.CGO_ENABLED = "0";
           };
 
-          portable-service = let
-            web-service = pkgs.replaceVars ./run/portable-service/tclip.service.in {
-              inherit tclipd;
-            };
-          in
-            pkgs.portableService {
-              inherit (tclipd) version;
-              pname = "tclip";
-              description = "The tclip service";
-              homepage = "https://github.com/tailscale-dev/tclip";
-              units = [web-service];
-              symlinks = [
-                {
-                  object = "${pkgs.cacert}/etc/ssl";
-                  symlink = "/etc/ssl";
-                }
-              ];
-            };
+          portable-service = pkgs.portableService {
+            inherit (tclipd) version;
+            pname = "tclip";
+            description = "The tclip service";
+            homepage = "https://github.com/tailscale-dev/tclip";
+            units = [service];
+            symlinks = [
+              {
+                object = "${pkgs.cacert}/etc/ssl";
+                symlink = "/etc/ssl";
+              }
+            ];
+          };
 
           # default = docker;
           default = tclipd;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           e2e = import ./nix/e2e.nix {
-            inherit pkgs headscale;
+            inherit pkgs headscale service;
             inherit (self.packages.${system}) tclip tclipd;
           };
         };
