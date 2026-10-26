@@ -258,7 +258,7 @@ VALUES
 		q,
 		id,
 		time.Now().Format(timeFormat),
-		userInfo.UserProfile.ID,
+		ownerID(userInfo),
 		fname,
 		data,
 	)
@@ -450,13 +450,13 @@ FROM pastes p
 WHERE p.id = ?1`
 
 	row := s.db.QueryRowContext(r.Context(), q, id)
-	var userIDOfPaste int64
+	var userIDOfPaste string
 	if err := row.Scan(&userIDOfPaste); err != nil {
 		s.ShowError(w, r, err, http.StatusInternalServerError)
 		return
 	}
 
-	if int64(ui.UserProfile.ID) != userIDOfPaste {
+	if ownerID(ui) != userIDOfPaste {
 		s.ShowError(w, r, errors.New("can only delete your pastes"), http.StatusForbidden)
 		return
 	}
@@ -466,7 +466,7 @@ DELETE FROM pastes
 WHERE id = ?1 AND user_id = ?2
 `
 
-	if _, err := s.db.ExecContext(r.Context(), q, id, ui.UserProfile.ID); err != nil {
+	if _, err := s.db.ExecContext(r.Context(), q, id, ownerID(ui)); err != nil {
 		s.ShowError(w, r, err, http.StatusInternalServerError)
 		return
 	}
@@ -519,7 +519,7 @@ WHERE p.id = ?1`
 
 	row := s.db.QueryRowContext(r.Context(), q, id)
 	var fname, data, userLoginName, userDisplayName, userProfilePicURL, lineNumbersClass, wordWrapClass string
-	var userID int64
+	var userID string
 	var createdAt string
 
 	err := row.Scan(&fname, &createdAt, &data, &userID, &userLoginName, &userDisplayName, &userProfilePicURL)
@@ -650,9 +650,9 @@ WHERE p.id = ?1`
 		}
 	}
 
-	var remoteUserID = tailcfg.UserID(0)
+	var remoteUserID string
 	if up != nil {
-		remoteUserID = up.ID
+		remoteUserID = ownerID(ui)
 	}
 
 	err = s.tmpls.ExecuteTemplate(w, "showpaste.html", struct {
@@ -661,9 +661,9 @@ WHERE p.id = ?1`
 		CreatedAt           string
 		PasterDisplayName   string
 		PasterProfilePicURL string
-		PasterUserID        int64
+		PasterUserID        string
 		DisplayUser         bool
-		UserID              int64
+		UserID              string
 		ID                  string
 		Data                string
 		RawHTML             *template.HTML
@@ -678,7 +678,7 @@ WHERE p.id = ?1`
 		PasterProfilePicURL: userProfilePicURL,
 		DisplayUser:         !*hidePasteUserInfo,
 		PasterUserID:        userID,
-		UserID:              int64(remoteUserID),
+		UserID:              remoteUserID,
 		ID:                  id,
 		Data:                data,
 		RawHTML:             rawHTML,
@@ -892,14 +892,21 @@ func md5Hash(inp string) string {
 	return fmt.Sprintf("%x", h.Sum([]byte(inp)))
 }
 
+func ownerID(userInfo *apitype.WhoIsResponse) string {
+	// User and node IDs occupy separate namespaces in the control server.
+	if len(userInfo.Node.Tags) > 0 {
+		return fmt.Sprintf("node:%d", userInfo.Node.ID)
+	}
+	return fmt.Sprintf("user:%d", userInfo.UserProfile.ID)
+}
+
 func upsertUserInfo(ctx context.Context, db *sql.DB, lc *tailscale.LocalClient, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	userInfo, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	if userInfo.UserProfile.LoginName == "tagged-devices" {
-		userInfo.UserProfile.ID = tailcfg.UserID(userInfo.Node.ID)
+	if len(userInfo.Node.Tags) > 0 {
 		userInfo.UserProfile.LoginName = userInfo.Node.Hostinfo.Hostname()
 		userInfo.UserProfile.DisplayName = fmt.Sprintf("tagged node %s: %s", userInfo.Node.Hostinfo.Hostname(), userInfo.Node.Tags[0])
 		userInfo.UserProfile.ProfilePicURL = fmt.Sprintf("https://www.gravatar.com/avatar/%s", md5Hash(userInfo.Node.ComputedNameWithHost))
@@ -928,7 +935,7 @@ ON CONFLICT DO
 	_, err = db.ExecContext(
 		ctx,
 		q,
-		userInfo.UserProfile.ID,
+		ownerID(userInfo),
 		userInfo.UserProfile.LoginName,
 		userInfo.UserProfile.DisplayName,
 		userInfo.UserProfile.ProfilePicURL,

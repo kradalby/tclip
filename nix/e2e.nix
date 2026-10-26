@@ -132,6 +132,16 @@ in
       def nodes():
           return json.loads(headscale.succeed("headscale nodes list -o json"))
 
+      def check_legacy_pastes():
+          for machine in (alice, tagged):
+              for identifier, content in legacy_content.items():
+                  path = "/paste/" + identifier
+                  assert request(machine, path + "/raw") == content
+                  assert f'href="/api/delete/{identifier}"' not in request(machine, path)
+                  request(machine, "/api/delete/" + identifier, 403)
+          assert sql("SELECT * FROM users WHERE id='2'") == legacy_author
+          assert sql("SELECT * FROM pastes WHERE user_id='2' ORDER BY id") == legacy_pastes
+
       start_all()
       server.wait_for_unit("multi-user.target")
       server_key = headscale.succeed("hs-authkey server").strip()
@@ -144,13 +154,23 @@ in
           assert not [n for n in nodes() if n['givenName'] == 'paste']
           headscale.succeed("HEADSCALE_CLI_TIMEOUT=60s headscale health")
           server.succeed("systemctl stop tclip")
+      # Legacy keys contain no evidence of whether a user or tagged node created a paste.
+      legacy_content = {"legacy-one": "first legacy body", "legacy-two": "second legacy body"}
+      # Matching current names must not claim historical ownership.
+      sql("INSERT INTO users VALUES ('2', 'alice', 'alice', 'legacy-avatar')")
+      for identifier, content in legacy_content.items():
+          sql(f"INSERT INTO pastes VALUES ('{identifier}', '2000-01-01 00:00', '2', '{identifier}.txt', '{content}')")
+      legacy_author = sql("SELECT * FROM users WHERE id='2'")
+      legacy_pastes = sql("SELECT * FROM pastes WHERE user_id='2' ORDER BY id")
       server.succeed(f"umask 077; printf '%s\\n' TS_AUTHKEY={q(server_key)} > /run/tclip-auth")
       server.succeed("systemctl start tclip")
+      headscale.wait_until_succeeds("headscale nodes list -o json | jq -e '.[] | select(.givenName == \"paste\")'", timeout=T)
+      # Serialize registration so a tagged node ID collides with Alice's user ID.
+      tagged_key = headscale.succeed("hs-authkey alice --tags tag:client").strip()
+      tagged.succeed(f"hs-join {tagged_key}")
       alice.succeed(f"hs-join {alice_key}")
       relay.succeed(f"hs-join {alice_key}")
       bob.succeed(f"hs-join {bob_key}")
-      tagged_key = headscale.succeed("hs-authkey alice --tags tag:client").strip()
-      tagged.succeed(f"hs-join {tagged_key}")
       tagged2.succeed(f"hs-join {tagged_key}")
       alice.wait_until_succeeds("curl -fsS --max-time 5 http://paste/help", timeout=T)
       paste_ip = alice.succeed("tailscale ip -4 paste").strip()
@@ -161,6 +181,53 @@ in
           server.succeed(f"grep -E '^CapEff:[[:space:]]+0+$' /proc/{pid}/status")
           server.succeed("test $(stat -c %a /var/lib/private/tclip/data) = 700")
           server.succeed("test $(stat -c %a /var/lib/private/tclip/data/tsnet) = 700")
+
+      with subtest("colliding node and user IDs cannot share authorship or deletion"):
+          registered = {n["givenName"]: n for n in nodes()}
+          assert int(registered["paste"]["id"]) == 1, registered
+          assert int(registered["tagged"]["id"]) == int(registered["alice"]["user"]["id"]) == 2, registered
+          assert int(registered["alice"]["id"]) == 3, registered
+          assert registered["tagged"]["tags"] == ["tag:client"], registered
+          assert not registered["alice"]["tags"], registered
+          print("collision identities: server node=1, tagged node=2, Alice user=2, Alice node=3")
+          collision = post(alice, "collision-alice.txt", "Alice owns this")
+          author_query = "SELECT u.login_name FROM pastes p JOIN users u ON p.user_id=u.id WHERE p.filename='collision-alice.txt'"
+          assert sql(author_query) == "alice"
+          request(tagged, "/help")
+          author_after = sql(author_query)
+          control = post(tagged, "collision-control.txt", "tagged owner is healthy")
+          request(tagged, "/api/delete/" + control.split("/")[-1], 307)
+          assert sql("SELECT count(*) FROM pastes WHERE filename='collision-control.txt'") == "0"
+          code = tagged.succeed(
+              f"curl -sS --max-time 10 -o /tmp/body -w '%{{http_code}}' http://paste/api/delete/{collision.split('/')[-1]}"
+          ).strip()
+          retained = sql("SELECT count(*) FROM pastes WHERE filename='collision-alice.txt'")
+          print(f"collision result: author={author_after}, cross-owner delete={code}, retained={retained}")
+          assert (author_after, code, retained) == ("alice", "403", "1")
+          assert request(bob, collision + "/raw") == "Alice owns this"
+          delete_link = f'href="/api/delete/{collision.split("/")[-1]}"'
+          assert delete_link not in request(tagged, collision)
+          assert delete_link in request(relay, collision)
+          tag_collision = post(tagged, "collision-tagged.txt", "tagged owns this")
+          request(alice, "/api/delete/" + tag_collision.split("/")[-1], 403)
+          assert request(bob, tag_collision + "/raw") == "tagged owns this"
+          tag_delete_link = f'href="/api/delete/{tag_collision.split("/")[-1]}"'
+          assert tag_delete_link not in request(alice, tag_collision)
+          assert tag_delete_link in request(tagged, tag_collision)
+          assert sql("SELECT u.login_name FROM pastes p JOIN users u ON p.user_id=u.id WHERE p.filename='collision-tagged.txt'") == "tagged"
+          request(relay, "/api/delete/" + collision.split("/")[-1], 307)
+          request(tagged, "/api/delete/" + tag_collision.split("/")[-1], 307)
+          assert sql("SELECT count(*) FROM pastes WHERE filename IN ('collision-alice.txt', 'collision-tagged.txt')") == "0"
+
+      with subtest("legacy pastes remain readable without granting ambiguous ownership"):
+          check_legacy_pastes()
+          assert "legacy-one.txt" in request(alice, "/paste/list")
+          assert request(headscale, "/paste/legacy-two/raw", base="http://server:8080") == legacy_content["legacy-two"]
+          for machine in (alice, tagged):
+              control = post(machine, "legacy-control.txt", "new ownership works")
+              request(machine, "/api/delete/" + control.split("/")[-1], 307)
+          assert sql("SELECT count(*) FROM pastes WHERE filename='legacy-control.txt'") == "0"
+          check_legacy_pastes()
 
       with subtest("WhoIs identity, shared reads, CLI and form uploads"):
           assert "alice" in request(alice, "/")
@@ -210,6 +277,7 @@ in
           assert request(tagged2, tag_paste + "/raw") == "tag-owned"
           request(tagged2, "/api/delete/" + tag_other.split("/")[-1], 307)
           request(tagged, "/api/delete/" + tag_paste.split("/")[-1], 307)
+          tag_durable = post(tagged, "tagged-durable.txt", "tagged restart")
 
       with subtest("direct and forced-DERP application traffic"):
           alice.wait_until_succeeds("tailscale ping -c 1 --timeout 3s paste", timeout=T)
@@ -278,13 +346,48 @@ in
           assert request(relay, paste + "/raw") == "hello from alice\nsecond line\n"
           assert author not in request(headscale, paste, base="http://server:8080")
           assert "alice" in request(alice, "/help")
+          assert sql("SELECT user_id FROM pastes WHERE filename='alice.txt'") == "user:2"
+          assert sql("SELECT user_id FROM pastes WHERE filename='tagged-durable.txt'") == "node:2"
+          request(tagged, "/api/delete/" + paste.split("/")[-1], 403)
+          request(alice, "/api/delete/" + tag_durable.split("/")[-1], 403)
+          assert request(bob, tag_durable + "/raw") == "tagged restart"
+          assert sql("SELECT u.login_name FROM pastes p JOIN users u ON p.user_id=u.id WHERE p.filename='tagged-durable.txt'") == "tagged"
           after = nodes()
           assert {(n['id'], n['ipAddresses'][0]) for n in before} == {(n['id'], n['ipAddresses'][0]) for n in after}
           request(bob, "/api/delete/" + paste.split("/")[-1], 403)
           request(alice, "/api/delete/" + paste.split("/")[-1], 307)
+          request(tagged, "/api/delete/" + tag_durable.split("/")[-1], 307)
           server.succeed("systemctl restart tclip")
           alice.wait_until_succeeds("curl -fsS --max-time 5 http://paste/help", timeout=T)
           assert sql("SELECT count(*) FROM pastes WHERE filename='alice.txt'") == "0"
+          assert sql("SELECT count(*) FROM pastes WHERE filename='tagged-durable.txt'") == "0"
+          check_legacy_pastes()
+
+      with subtest("verified per-paste reassignment preserves other legacy records"):
+          # The fixture supplies provenance explicitly; the application never infers it.
+          server.succeed("systemctl stop tclip")
+          before_content = sql("SELECT id, created_at, filename, data FROM pastes WHERE id='legacy-one'")
+          assert sql("""
+              PRAGMA foreign_keys=ON;
+              BEGIN IMMEDIATE;
+              UPDATE pastes SET user_id='user:2'
+              WHERE id='legacy-one' AND user_id='2'
+                AND EXISTS (SELECT 1 FROM users WHERE id='user:2');
+              SELECT changes();
+              COMMIT;
+          """) == "1"
+          assert sql("SELECT id, created_at, filename, data FROM pastes WHERE id='legacy-one'") == before_content
+          server.succeed("systemctl start tclip")
+          alice.wait_until_succeeds("curl -fsS --max-time 5 http://paste/help", timeout=T)
+          request(tagged, "/api/delete/legacy-one", 403)
+          assert request(alice, "/paste/legacy-one/raw") == legacy_content["legacy-one"]
+          request(relay, "/api/delete/legacy-one", 307)
+          assert sql("SELECT count(*) FROM pastes WHERE id='legacy-one'") == "0"
+          for machine in (alice, tagged):
+              request(machine, "/api/delete/legacy-two", 403)
+              assert request(machine, "/paste/legacy-two/raw") == legacy_content["legacy-two"]
+          assert sql("SELECT * FROM users WHERE id='2'") == legacy_author
+          assert sql("SELECT * FROM pastes WHERE id='legacy-two'") == legacy_pastes.splitlines()[1]
 
       with subtest("real application TLS with a cached certificate and trusted peer"):
           state = "/var/lib/private/tclip/data/tsnet"

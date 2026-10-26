@@ -216,6 +216,58 @@ Add the path `/var/lib/private/tclip` to your backup program of
 choice.
 
 
+## Upgrading paste ownership
+
+Paste owners now use separate `user:<user ID>` and `node:<node ID>` keys from
+authenticated WhoIs data. Devices belonging to one user share ownership;
+tagged nodes have separate ownership even when they carry the same tags.
+
+Older databases stored both kinds as bare numbers. Equal user and node IDs
+could overwrite author metadata and authorize another identity to delete a
+paste. Those records cannot reliably identify their original owner: a single
+number can refer to pastes created by both kinds of principal.
+
+Upgrading leaves existing paste content, IDs, timestamps, and stored author
+records intact. Legacy pastes remain readable, but their delete links are hidden
+and deletion requests return HTTP 403. New pastes have normal owner-only
+deletion. Stored legacy attribution may already be inaccurate; retaining it
+does not recover historical ownership.
+
+### Resolving a verified legacy paste
+
+There is no automatic claiming or bulk numeric-ID migration. An administrator
+can resolve an individual paste only after independently verifying its original
+owner. Current WhoIs, numeric IDs, names, tags, and stored author metadata alone
+do not prove who created a historical paste. Leave unresolved pastes unchanged.
+
+1. Have the verified owner visit the upgraded service so their typed `users.id`
+   record exists. Confirm that typed key against the authenticated identity.
+2. Stop tclip and make a consistent SQLite backup of `DATA_DIR/data.db`, for
+   example with SQLite's `.backup` command.
+3. In SQLite, enable foreign keys and update only the verified paste in a
+   transaction. Substitute the verified values in this example:
+
+   ```sql
+   PRAGMA foreign_keys=ON;
+   BEGIN IMMEDIATE;
+   UPDATE pastes SET user_id='user:2'
+   WHERE id='verified-paste-id' AND user_id='2'
+     AND EXISTS (SELECT 1 FROM users WHERE id='user:2');
+   SELECT changes();
+   ```
+
+   Commit only if `changes()` returns `1` and the selected paste and target owner
+   are correct; otherwise roll back. A verified tagged owner uses `node:<node ID>`.
+   Keep the legacy `users` row because other unresolved pastes may reference it.
+4. Restart tclip. The verified owner can now delete that paste; other legacy
+   pastes remain readable and deletion-denied.
+
+Before upgrading, retain a consistent database backup and the tsnet state.
+Older binaries cannot fully read typed owner keys and still have the collision
+bug; do not run old and new versions against the same database. Downgrading is
+not an automatic reversal: preserve post-upgrade data separately before any
+restore, since an earlier backup does not contain newer pastes.
+
 ## Headscale integration tests
 
 On Linux with KVM and Nix sandboxing enabled:
@@ -246,6 +298,11 @@ Coverage:
 - Owner-only deletion, including another device belonging to the same user;
   cross-user and spoofed-header denial with successful read/delete controls.
 - Tagged-node authorship and separate ownership for two nodes carrying one tag.
+- A real numeric user/node ID collision: isolated authors, both deletion-denial
+  directions, ownership-aware delete links, and both identities across restart.
+- Legacy numeric-key pastes stay readable and unchanged alongside new typed
+  owners; both colliding principals are denied deletion before and after restart.
+  Explicit verified per-paste reassignment preserves content and unrelated rows.
 - Direct-path proof and forced `DERP(headscale)` proof alongside application
   uploads/downloads; local-user ACLs (`USER@`), tag ACLs, live deny/reallow, and
   an allowed upload/read while another user is blocked.
