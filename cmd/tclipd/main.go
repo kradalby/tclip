@@ -30,7 +30,6 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
-	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -43,7 +42,6 @@ var (
 	hidePasteUserInfo = flag.Bool("hide-funnel-users", hasEnv("HIDE_FUNNEL_USERS"), "if set, display the username and profile picture of the user who created the paste in funneled pastes")
 	httpPort          = flag.String("http-port", envOr("HTTP_PORT", ""), "optional http port to start an http server on, e.g for reverse proxies. will only serve funnel endpoints")
 	controlUrl        = flag.String("control-url", envOr("TSNET_CONTROL_URL", ""), "optional alternate control server URL to use, for e.g. headscale")
-	disableNetNS      = flag.Bool("disable-netns", hasEnv("TSNET_DISABLE_NETNS"), "disable tsnet interface binding on unprivileged multihomed hosts, TSNET_DISABLE_NETNS in the environment")
 	disableHTTPS      = flag.Bool("disable-https", hasEnv("DISABLE_HTTPS"), "disable http serve, required for Headscale support")
 	enableLineNumbers = flag.Bool("enable-line-numbers", hasEnv("ENABLE_LINE_NUMBERS"), "enables line numbers on paste content")
 	enableWordWrap    = flag.Bool("enable-word-wrap", hasEnv("ENABLE_WORD_WRAP"), "enable word wrap on paste content")
@@ -258,7 +256,7 @@ VALUES
 		q,
 		id,
 		time.Now().Format(timeFormat),
-		ownerID(userInfo),
+		userInfo.UserProfile.ID,
 		fname,
 		data,
 	)
@@ -450,13 +448,13 @@ FROM pastes p
 WHERE p.id = ?1`
 
 	row := s.db.QueryRowContext(r.Context(), q, id)
-	var userIDOfPaste string
+	var userIDOfPaste int64
 	if err := row.Scan(&userIDOfPaste); err != nil {
 		s.ShowError(w, r, err, http.StatusInternalServerError)
 		return
 	}
 
-	if ownerID(ui) != userIDOfPaste {
+	if int64(ui.UserProfile.ID) != userIDOfPaste {
 		s.ShowError(w, r, errors.New("can only delete your pastes"), http.StatusForbidden)
 		return
 	}
@@ -466,7 +464,7 @@ DELETE FROM pastes
 WHERE id = ?1 AND user_id = ?2
 `
 
-	if _, err := s.db.ExecContext(r.Context(), q, id, ownerID(ui)); err != nil {
+	if _, err := s.db.ExecContext(r.Context(), q, id, ui.UserProfile.ID); err != nil {
 		s.ShowError(w, r, err, http.StatusInternalServerError)
 		return
 	}
@@ -519,7 +517,7 @@ WHERE p.id = ?1`
 
 	row := s.db.QueryRowContext(r.Context(), q, id)
 	var fname, data, userLoginName, userDisplayName, userProfilePicURL, lineNumbersClass, wordWrapClass string
-	var userID string
+	var userID int64
 	var createdAt string
 
 	err := row.Scan(&fname, &createdAt, &data, &userID, &userLoginName, &userDisplayName, &userProfilePicURL)
@@ -650,9 +648,9 @@ WHERE p.id = ?1`
 		}
 	}
 
-	var remoteUserID string
+	var remoteUserID = tailcfg.UserID(0)
 	if up != nil {
-		remoteUserID = ownerID(ui)
+		remoteUserID = up.ID
 	}
 
 	err = s.tmpls.ExecuteTemplate(w, "showpaste.html", struct {
@@ -661,15 +659,15 @@ WHERE p.id = ?1`
 		CreatedAt           string
 		PasterDisplayName   string
 		PasterProfilePicURL string
-		PasterUserID        string
+		PasterUserID        int64
 		DisplayUser         bool
-		UserID              string
+		UserID              int64
 		ID                  string
 		Data                string
 		RawHTML             *template.HTML
 		CSSClass            string
 		EnableLineNumbers   string
-		EnableWordWrap      string
+		EnableWordWrap		string
 	}{
 		UserInfo:            up,
 		Title:               fname,
@@ -678,13 +676,13 @@ WHERE p.id = ?1`
 		PasterProfilePicURL: userProfilePicURL,
 		DisplayUser:         !*hidePasteUserInfo,
 		PasterUserID:        userID,
-		UserID:              remoteUserID,
+		UserID:              int64(remoteUserID),
 		ID:                  id,
 		Data:                data,
 		RawHTML:             rawHTML,
 		CSSClass:            cssClass,
 		EnableLineNumbers:   lineNumbersClass,
-		EnableWordWrap:      wordWrapClass,
+		EnableWordWrap:		 wordWrapClass,
 	})
 	if err != nil {
 		log.Printf("%s: %v", r.RemoteAddr, err)
@@ -693,11 +691,6 @@ WHERE p.id = ?1`
 
 func main() {
 	flag.Parse()
-
-	// Unprivileged multihomed hosts may need the routing table instead of interface binding.
-	if *disableNetNS {
-		netns.SetEnabled(false)
-	}
 
 	os.MkdirAll(*dataDir, 0700)
 	os.MkdirAll(filepath.Join(*dataDir, "tsnet"), 0700)
@@ -749,8 +742,8 @@ func main() {
 	}
 
 	// if the user disabled HTTPS or HTTPS is unavailable
-	if *disableHTTPS {
-		tclipURL = *hostname
+		if *disableHTTPS {
+			tclipURL = *hostname
 	}
 
 	ln, err := s.Listen("tcp", ":80")
@@ -892,21 +885,14 @@ func md5Hash(inp string) string {
 	return fmt.Sprintf("%x", h.Sum([]byte(inp)))
 }
 
-func ownerID(userInfo *apitype.WhoIsResponse) string {
-	// User and node IDs occupy separate namespaces in the control server.
-	if len(userInfo.Node.Tags) > 0 {
-		return fmt.Sprintf("node:%d", userInfo.Node.ID)
-	}
-	return fmt.Sprintf("user:%d", userInfo.UserProfile.ID)
-}
-
 func upsertUserInfo(ctx context.Context, db *sql.DB, lc *tailscale.LocalClient, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	userInfo, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(userInfo.Node.Tags) > 0 {
+	if userInfo.UserProfile.LoginName == "tagged-devices" {
+		userInfo.UserProfile.ID = tailcfg.UserID(userInfo.Node.ID)
 		userInfo.UserProfile.LoginName = userInfo.Node.Hostinfo.Hostname()
 		userInfo.UserProfile.DisplayName = fmt.Sprintf("tagged node %s: %s", userInfo.Node.Hostinfo.Hostname(), userInfo.Node.Tags[0])
 		userInfo.UserProfile.ProfilePicURL = fmt.Sprintf("https://www.gravatar.com/avatar/%s", md5Hash(userInfo.Node.ComputedNameWithHost))
@@ -935,7 +921,7 @@ ON CONFLICT DO
 	_, err = db.ExecContext(
 		ctx,
 		q,
-		ownerID(userInfo),
+		userInfo.UserProfile.ID,
 		userInfo.UserProfile.LoginName,
 		userInfo.UserProfile.DisplayName,
 		userInfo.UserProfile.ProfilePicURL,
