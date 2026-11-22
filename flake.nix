@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-unstable";
+    headscale.url = "github:juanfont/headscale/main";
     utils.url = "github:numtide/flake-utils";
   };
 
@@ -10,6 +11,7 @@
     self,
     nixpkgs,
     utils,
+    headscale,
   }:
     utils.lib.eachSystem [
       "x86_64-linux"
@@ -59,6 +61,13 @@
 
         # default = docker;
         default = tclipd;
+      };
+
+      checks = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        headscale = import ./nix/e2e.nix {
+          inherit pkgs headscale;
+          inherit (self.packages.${system}) tclip tclipd;
+        };
       };
 
       apps.default =
